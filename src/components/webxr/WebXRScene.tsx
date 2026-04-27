@@ -22,9 +22,10 @@ interface SceneState {
   renderer: THREE.WebGLRenderer
   scene: THREE.Scene
   camera: THREE.PerspectiveCamera
-  modelGroup: THREE.Group       // contenedor general (posicionado en mundo)
-  innerModel: THREE.Group       // modelo 3D rotable/escalable por gestos
+  modelGroup: THREE.Group        // contenedor general (posicionado en mundo)
+  innerModel: THREE.Group        // modelo 3D rotable/escalable por gestos
   panels: THREE.Mesh[]
+  defaultPanelPos: THREE.Vector3[]  // posiciones por defecto para Restablecer
   positioned: { current: boolean }
   cleanup: () => void
 }
@@ -135,30 +136,48 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
         (err) => console.error('GLB load failed:', err),
       )
 
-      /* Paneles */
+      /* Paneles — layout simétrico: principal arriba, 3 KPIs en fila debajo */
       const mainPanel = createTextPanel(machine)
-      mainPanel.position.set(0, TARGET_MODEL_SIZE * 0.85, 0)
+      mainPanel.position.set(0, 0.55, 0)
       modelGroup.add(mainPanel)
 
       const kpiOEE = createKpiPanel({ label: 'OEE', value: machine.kpis.oee })
-      kpiOEE.position.set(-0.55, 0.1, 0)
+      kpiOEE.position.set(-0.42, -0.5, 0)
       modelGroup.add(kpiOEE)
 
       const kpiRendimiento = createKpiPanel({ label: 'Rendimiento', value: machine.kpis.rendimiento })
-      kpiRendimiento.position.set(0.55, 0.18, 0)
+      kpiRendimiento.position.set(0, -0.5, 0)
       modelGroup.add(kpiRendimiento)
 
       const kpiCalidad = createKpiPanel({ label: 'Calidad', value: machine.kpis.calidad })
-      kpiCalidad.position.set(0.55, -0.12, 0)
+      kpiCalidad.position.set(0.42, -0.5, 0)
       modelGroup.add(kpiCalidad)
 
       const panels = [mainPanel, kpiOEE, kpiRendimiento, kpiCalidad]
+      const defaultPanelPos = panels.map((p) => p.position.clone())
       const positioned = { current: false }
 
-      /* Gestos: rotar con un dedo, escalar con dos dedos */
+      /* Gestos:
+         - 1 dedo sobre un panel: arrastra ese panel
+         - 1 dedo en espacio libre: rota todo el conjunto
+         - 2 dedos: escala solo el modelo (paneles mantienen tamaño legible) */
+      let mode: 'idle' | 'rotate' | 'panPanel' | 'pinch' = 'idle'
+      let draggedPanel: THREE.Mesh | null = null
       let touchLastX = 0
       let touchStartDist = 0
       let touchStartScale = 1
+
+      const raycaster = new THREE.Raycaster()
+      const ndc = new THREE.Vector2()
+      const dragPlane = new THREE.Plane()
+      const dragOffset = new THREE.Vector3()
+      const tmpHit = new THREE.Vector3()
+      const tmpVec = new THREE.Vector3()
+
+      const setNdcFromTouch = (t: Touch) => {
+        ndc.x = (t.clientX / window.innerWidth) * 2 - 1
+        ndc.y = -(t.clientY / window.innerHeight) * 2 + 1
+      }
 
       const isUiTarget = (target: EventTarget | null): boolean => {
         if (!(target instanceof HTMLElement)) return false
@@ -168,22 +187,56 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
       const onTouchStart = (e: TouchEvent) => {
         if (isUiTarget(e.target)) return
         if (e.touches.length === 1) {
-          touchLastX = e.touches[0].clientX
+          setNdcFromTouch(e.touches[0])
+          const xrCam = renderer.xr.getCamera()
+          raycaster.setFromCamera(ndc, xrCam)
+          const hits = raycaster.intersectObjects(panels, false)
+          if (hits.length > 0) {
+            // Drag panel mode — define plano frente a cámara que pasa por el hit
+            draggedPanel = hits[0].object as THREE.Mesh
+            mode = 'panPanel'
+            xrCam.getWorldPosition(tmpVec)
+            const planeNormal = new THREE.Vector3().subVectors(tmpVec, hits[0].point).normalize()
+            dragPlane.setFromNormalAndCoplanarPoint(planeNormal, hits[0].point)
+            // Offset entre punto tocado y centro del panel (mundo)
+            const panelWorld = new THREE.Vector3()
+            draggedPanel.getWorldPosition(panelWorld)
+            dragOffset.subVectors(hits[0].point, panelWorld)
+          } else {
+            // Rotate mode
+            mode = 'rotate'
+            touchLastX = e.touches[0].clientX
+          }
         } else if (e.touches.length === 2) {
+          mode = 'pinch'
           const dx = e.touches[0].clientX - e.touches[1].clientX
           const dy = e.touches[0].clientY - e.touches[1].clientY
           touchStartDist = Math.hypot(dx, dy)
           touchStartScale = innerModel.scale.x
         }
       }
+
       const onTouchMove = (e: TouchEvent) => {
         if (isUiTarget(e.target)) return
-        if (e.touches.length === 1) {
+        if (mode === 'panPanel' && draggedPanel && e.touches.length === 1) {
+          setNdcFromTouch(e.touches[0])
+          const xrCam = renderer.xr.getCamera()
+          raycaster.setFromCamera(ndc, xrCam)
+          if (raycaster.ray.intersectPlane(dragPlane, tmpHit)) {
+            // tmpHit = posición mundo donde el rayo cruza el plano
+            // posición mundo del panel = tmpHit - offset
+            tmpHit.sub(dragOffset)
+            // Convertir a espacio local del modelGroup
+            modelGroup.worldToLocal(tmpHit)
+            draggedPanel.position.copy(tmpHit)
+          }
+          e.preventDefault()
+        } else if (mode === 'rotate' && e.touches.length === 1) {
           const dx = e.touches[0].clientX - touchLastX
-          innerModel.rotation.y += dx * 0.008
+          modelGroup.rotation.y += dx * 0.008
           touchLastX = e.touches[0].clientX
           e.preventDefault()
-        } else if (e.touches.length === 2 && touchStartDist > 0) {
+        } else if (mode === 'pinch' && e.touches.length === 2 && touchStartDist > 0) {
           const dx = e.touches[0].clientX - e.touches[1].clientX
           const dy = e.touches[0].clientY - e.touches[1].clientY
           const dist = Math.hypot(dx, dy)
@@ -194,9 +247,18 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
         }
       }
 
+      const onTouchEnd = (e: TouchEvent) => {
+        if (e.touches.length === 0) {
+          mode = 'idle'
+          draggedPanel = null
+        }
+      }
+
       const overlayEl = overlayRef.current
       overlayEl.addEventListener('touchstart', onTouchStart, { passive: true })
       overlayEl.addEventListener('touchmove', onTouchMove, { passive: false })
+      overlayEl.addEventListener('touchend', onTouchEnd, { passive: true })
+      overlayEl.addEventListener('touchcancel', onTouchEnd, { passive: true })
 
       /* Loop de render con billboard + posicionamiento inicial */
       const camWorldPos = new THREE.Vector3()
@@ -246,10 +308,13 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
         modelGroup,
         innerModel,
         panels,
+        defaultPanelPos,
         positioned,
         cleanup: () => {
           overlayEl.removeEventListener('touchstart', onTouchStart)
           overlayEl.removeEventListener('touchmove', onTouchMove)
+          overlayEl.removeEventListener('touchend', onTouchEnd)
+          overlayEl.removeEventListener('touchcancel', onTouchEnd)
           window.removeEventListener('resize', onResize)
           renderer.setAnimationLoop(null)
           const activeSession = renderer.xr.getSession()
@@ -284,24 +349,29 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
     const state = sceneRef.current
     if (!state) return
     const xrCam = state.renderer.xr.getCamera()
-    placeInFrontOfCamera(xrCam, state.modelGroup)
+    state.modelGroup.rotation.set(0, 0, 0)
     state.innerModel.rotation.set(0, 0, 0)
+    placeInFrontOfCamera(xrCam, state.modelGroup)
   }
 
-  /* ── Reset escala (zoom out a tamaño objetivo) ──────────────────────── */
-  const resetScale = () => {
+  /* ── Restablecer paneles y escala (preserva posición y rotación) ───── */
+  const restoreLayout = () => {
     const state = sceneRef.current
     if (!state) return
-    // Forzar al usuario a regresar a la escala "natural" auto-calculada
-    // recargando el bounding box del primer hijo
+    // Paneles a posiciones por defecto
+    for (let i = 0; i < state.panels.length; i++) {
+      state.panels[i].position.copy(state.defaultPanelPos[i])
+    }
+    // Escala del modelo a auto-computada
     const inner = state.innerModel
     const child = inner.children[0]
-    if (!child) return
-    inner.scale.set(1, 1, 1)
-    const box = new THREE.Box3().setFromObject(child)
-    const size = box.getSize(new THREE.Vector3())
-    const maxDim = Math.max(size.x, size.y, size.z, 0.001)
-    inner.scale.setScalar(TARGET_MODEL_SIZE / maxDim)
+    if (child) {
+      inner.scale.set(1, 1, 1)
+      const box = new THREE.Box3().setFromObject(child)
+      const size = box.getSize(new THREE.Vector3())
+      const maxDim = Math.max(size.x, size.y, size.z, 0.001)
+      inner.scale.setScalar(TARGET_MODEL_SIZE / maxDim)
+    }
   }
 
   /* ── Cleanup al desmontar ───────────────────────────────────────────── */
@@ -338,10 +408,10 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
             Recentrar
           </button>
           <button
-            onClick={resetScale}
+            onClick={restoreLayout}
             className="rounded-xl bg-slate-800/90 px-5 py-3 text-sm font-semibold text-white shadow-lg hover:bg-slate-700 active:scale-95 transition-all"
           >
-            Tamaño 1×
+            Restablecer
           </button>
         </div>
       )}
@@ -350,7 +420,7 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
           data-xr-ui
           className="pointer-events-none absolute top-6 left-1/2 z-[60] -translate-x-1/2 rounded-full bg-slate-900/70 px-4 py-1.5 text-xs text-slate-200"
         >
-          Arrastra para rotar · Pellizca para escalar
+          Arrastra panel para moverlo · fuera de paneles para rotar · Pellizca para escalar
         </div>
       )}
     </div>
@@ -439,9 +509,10 @@ function PreLaunchScreen({
 
         <ul className="mt-4 space-y-1 text-xs text-slate-500">
           <li>· El modelo aparecerá frente a ti al iniciar</li>
-          <li>· Arrastra con un dedo para rotarlo</li>
-          <li>· Pellizca con dos dedos para escalarlo</li>
-          <li>· Usa &quot;Recentrar&quot; si pierdes el modelo de vista</li>
+          <li>· Toca y arrastra cada panel para reposicionarlo</li>
+          <li>· Arrastra fuera de paneles para rotar el conjunto</li>
+          <li>· Pellizca con dos dedos para escalar el modelo</li>
+          <li>· &quot;Recentrar&quot; o &quot;Restablecer&quot; si quieres reiniciar</li>
         </ul>
 
         <button
