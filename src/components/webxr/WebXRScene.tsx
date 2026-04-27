@@ -9,10 +9,12 @@ import { useWebXRSupport } from './useWebXRSupport'
 import { createTextPanel } from './createTextPanel'
 import { createKpiPanel } from './createKpiPanel'
 
-const MODEL_SCALE = 0.1
-const MODEL_OFFSET_Y = -0.3
-const MODEL_OFFSET_Z = -1.2
-const PANEL_LIFT = 0.55
+/* ── Configuración escala/posición ────────────────────────────────────── */
+const TARGET_MODEL_SIZE = 0.6     // metros — tamaño objetivo del modelo en su dimensión mayor
+const MODEL_DISTANCE = 1.5        // metros — distancia inicial frente al usuario
+const PIVOT_DROP = 0.25           // bajar levemente respecto a la cámara
+const MIN_SCALE = 0.2
+const MAX_SCALE = 4.0
 
 type Phase = 'pre' | 'launching' | 'in-session' | 'error'
 
@@ -20,8 +22,10 @@ interface SceneState {
   renderer: THREE.WebGLRenderer
   scene: THREE.Scene
   camera: THREE.PerspectiveCamera
-  modelGroup: THREE.Group
+  modelGroup: THREE.Group       // contenedor general (posicionado en mundo)
+  innerModel: THREE.Group       // modelo 3D rotable/escalable por gestos
   panels: THREE.Mesh[]
+  positioned: { current: boolean }
   cleanup: () => void
 }
 
@@ -35,6 +39,38 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
   const sceneRef = useRef<SceneState | null>(null)
+
+  /* ── Orientación correcta del panel hacia la cámara (sin espejado) ─── */
+  const billboard = (() => {
+    const fwd = new THREE.Vector3()
+    const up = new THREE.Vector3(0, 1, 0)
+    const right = new THREE.Vector3()
+    const newUp = new THREE.Vector3()
+    const m = new THREE.Matrix4()
+    return (panel: THREE.Object3D, panelWorld: THREE.Vector3, camWorld: THREE.Vector3) => {
+      fwd.subVectors(camWorld, panelWorld).normalize()
+      right.crossVectors(up, fwd)
+      if (right.lengthSq() < 0.0001) right.set(1, 0, 0)
+      else right.normalize()
+      newUp.crossVectors(fwd, right).normalize()
+      m.makeBasis(right, newUp, fwd)
+      panel.quaternion.setFromRotationMatrix(m)
+    }
+  })()
+
+  /* ── Posicionar el modelGroup frente a la cámara ────────────────────── */
+  const placeInFrontOfCamera = (camera: THREE.Camera, group: THREE.Group) => {
+    const camPos = new THREE.Vector3()
+    const camDir = new THREE.Vector3()
+    camera.getWorldPosition(camPos)
+    camera.getWorldDirection(camDir)
+    // dirección horizontal — ignorar componente Y para evitar inclinación
+    camDir.y = 0
+    if (camDir.lengthSq() < 0.0001) camDir.set(0, 0, -1)
+    else camDir.normalize()
+    group.position.copy(camPos).addScaledVector(camDir, MODEL_DISTANCE)
+    group.position.y -= PIVOT_DROP
+  }
 
   /* ── Iniciar sesión AR ─────────────────────────────────────────────── */
   const startAR = async () => {
@@ -65,57 +101,122 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
       dir.position.set(1, 2, 1)
       scene.add(dir)
 
-      /* Group raíz — facilita recentrar todo de una vez */
+      /* Jerarquía:
+         modelGroup (posicionado en mundo)
+         ├── innerModel (rota/escala con gestos)
+         │   └── gltf.scene (centrado y normalizado)
+         ├── mainPanel (billboard)
+         └── kpis (billboard)
+      */
       const modelGroup = new THREE.Group()
-      modelGroup.position.set(0, MODEL_OFFSET_Y, MODEL_OFFSET_Z)
       scene.add(modelGroup)
 
-      /* Modelo 3D */
+      const innerModel = new THREE.Group()
+      modelGroup.add(innerModel)
+
+      /* Carga + auto-escalado */
       const loader = new GLTFLoader()
       loader.load(
         '/models/dyeing-machine.glb',
         (gltf) => {
-          gltf.scene.scale.set(MODEL_SCALE, MODEL_SCALE, MODEL_SCALE)
-          modelGroup.add(gltf.scene)
+          const obj = gltf.scene
+          // Centrar en bounding box
+          const box = new THREE.Box3().setFromObject(obj)
+          const center = box.getCenter(new THREE.Vector3())
+          const size = box.getSize(new THREE.Vector3())
+          obj.position.sub(center)
+          // Auto-escalar para que su dimensión mayor sea TARGET_MODEL_SIZE
+          const maxDim = Math.max(size.x, size.y, size.z, 0.001)
+          const autoScale = TARGET_MODEL_SIZE / maxDim
+          innerModel.scale.setScalar(autoScale)
+          innerModel.add(obj)
         },
         undefined,
         (err) => console.error('GLB load failed:', err),
       )
 
-      /* Panel principal */
+      /* Paneles */
       const mainPanel = createTextPanel(machine)
-      mainPanel.position.set(0, PANEL_LIFT, 0)
+      mainPanel.position.set(0, TARGET_MODEL_SIZE * 0.85, 0)
       modelGroup.add(mainPanel)
 
-      /* KPIs */
       const kpiOEE = createKpiPanel({ label: 'OEE', value: machine.kpis.oee })
-      kpiOEE.position.set(-0.45, 0.1, 0)
+      kpiOEE.position.set(-0.55, 0.1, 0)
       modelGroup.add(kpiOEE)
 
       const kpiRendimiento = createKpiPanel({ label: 'Rendimiento', value: machine.kpis.rendimiento })
-      kpiRendimiento.position.set(0.45, 0.15, 0)
+      kpiRendimiento.position.set(0.55, 0.18, 0)
       modelGroup.add(kpiRendimiento)
 
       const kpiCalidad = createKpiPanel({ label: 'Calidad', value: machine.kpis.calidad })
-      kpiCalidad.position.set(0.45, -0.1, 0)
+      kpiCalidad.position.set(0.55, -0.12, 0)
       modelGroup.add(kpiCalidad)
 
       const panels = [mainPanel, kpiOEE, kpiRendimiento, kpiCalidad]
+      const positioned = { current: false }
 
-      /* Loop de render con billboard */
+      /* Gestos: rotar con un dedo, escalar con dos dedos */
+      let touchLastX = 0
+      let touchStartDist = 0
+      let touchStartScale = 1
+
+      const isUiTarget = (target: EventTarget | null): boolean => {
+        if (!(target instanceof HTMLElement)) return false
+        return target.closest('[data-xr-ui]') !== null
+      }
+
+      const onTouchStart = (e: TouchEvent) => {
+        if (isUiTarget(e.target)) return
+        if (e.touches.length === 1) {
+          touchLastX = e.touches[0].clientX
+        } else if (e.touches.length === 2) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX
+          const dy = e.touches[0].clientY - e.touches[1].clientY
+          touchStartDist = Math.hypot(dx, dy)
+          touchStartScale = innerModel.scale.x
+        }
+      }
+      const onTouchMove = (e: TouchEvent) => {
+        if (isUiTarget(e.target)) return
+        if (e.touches.length === 1) {
+          const dx = e.touches[0].clientX - touchLastX
+          innerModel.rotation.y += dx * 0.008
+          touchLastX = e.touches[0].clientX
+          e.preventDefault()
+        } else if (e.touches.length === 2 && touchStartDist > 0) {
+          const dx = e.touches[0].clientX - e.touches[1].clientX
+          const dy = e.touches[0].clientY - e.touches[1].clientY
+          const dist = Math.hypot(dx, dy)
+          const ratio = dist / touchStartDist
+          const next = Math.max(MIN_SCALE, Math.min(MAX_SCALE, touchStartScale * ratio))
+          innerModel.scale.setScalar(next)
+          e.preventDefault()
+        }
+      }
+
+      const overlayEl = overlayRef.current
+      overlayEl.addEventListener('touchstart', onTouchStart, { passive: true })
+      overlayEl.addEventListener('touchmove', onTouchMove, { passive: false })
+
+      /* Loop de render con billboard + posicionamiento inicial */
       const camWorldPos = new THREE.Vector3()
+      const panelWorldPos = new THREE.Vector3()
+
       renderer.setAnimationLoop(() => {
-        camera.getWorldPosition(camWorldPos)
+        const xrCam = renderer.xr.getCamera()
+        if (!positioned.current && renderer.xr.isPresenting) {
+          placeInFrontOfCamera(xrCam, modelGroup)
+          positioned.current = true
+        }
+        xrCam.getWorldPosition(camWorldPos)
         for (const panel of panels) {
-          panel.lookAt(camWorldPos)
-          // PlaneGeometry: la cara texturizada es +Z. lookAt orienta -Z al target.
-          // Flip 180° en Y para que el texto se vea correctamente.
-          panel.rotateY(Math.PI)
+          panel.getWorldPosition(panelWorldPos)
+          billboard(panel, panelWorldPos, camWorldPos)
         }
         renderer.render(scene, camera)
       })
 
-      /* Resize handler */
+      /* Resize */
       const onResize = () => {
         camera.aspect = window.innerWidth / window.innerHeight
         camera.updateProjectionMatrix()
@@ -143,18 +244,22 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
         scene,
         camera,
         modelGroup,
+        innerModel,
         panels,
+        positioned,
         cleanup: () => {
+          overlayEl.removeEventListener('touchstart', onTouchStart)
+          overlayEl.removeEventListener('touchmove', onTouchMove)
           window.removeEventListener('resize', onResize)
           renderer.setAnimationLoop(null)
-          if (renderer.xr.getSession()) {
-            renderer.xr.getSession()?.end().catch(() => undefined)
+          const activeSession = renderer.xr.getSession()
+          if (activeSession) {
+            activeSession.end().catch(() => undefined)
           }
           renderer.dispose()
           if (overlayRef.current?.contains(renderer.domElement)) {
             overlayRef.current.removeChild(renderer.domElement)
           }
-          /* Liberar geometrías y texturas de paneles */
           for (const p of panels) {
             p.geometry.dispose()
             const mat = p.material as THREE.MeshBasicMaterial
@@ -167,7 +272,6 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
       console.error(err)
       setErrorMsg(err instanceof Error ? err.message : 'Error desconocido al iniciar AR.')
       setPhase('error')
-      // Limpieza parcial si algo se montó
       if (sceneRef.current) {
         sceneRef.current.cleanup()
         sceneRef.current = null
@@ -175,17 +279,29 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
     }
   }
 
-  /* ── Recentrar modelo frente a la cámara ───────────────────────────── */
+  /* ── Recentrar ──────────────────────────────────────────────────────── */
   const recenter = () => {
     const state = sceneRef.current
     if (!state) return
-    const { camera, modelGroup } = state
-    const camPos = new THREE.Vector3()
-    const camDir = new THREE.Vector3()
-    camera.getWorldPosition(camPos)
-    camera.getWorldDirection(camDir)
-    modelGroup.position.copy(camPos).addScaledVector(camDir, 1.2)
-    modelGroup.position.y += MODEL_OFFSET_Y
+    const xrCam = state.renderer.xr.getCamera()
+    placeInFrontOfCamera(xrCam, state.modelGroup)
+    state.innerModel.rotation.set(0, 0, 0)
+  }
+
+  /* ── Reset escala (zoom out a tamaño objetivo) ──────────────────────── */
+  const resetScale = () => {
+    const state = sceneRef.current
+    if (!state) return
+    // Forzar al usuario a regresar a la escala "natural" auto-calculada
+    // recargando el bounding box del primer hijo
+    const inner = state.innerModel
+    const child = inner.children[0]
+    if (!child) return
+    inner.scale.set(1, 1, 1)
+    const box = new THREE.Box3().setFromObject(child)
+    const size = box.getSize(new THREE.Vector3())
+    const maxDim = Math.max(size.x, size.y, size.z, 0.001)
+    inner.scale.setScalar(TARGET_MODEL_SIZE / maxDim)
   }
 
   /* ── Cleanup al desmontar ───────────────────────────────────────────── */
@@ -198,23 +314,43 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
     }
   }, [])
 
-  /* ── Render UI según estado ─────────────────────────────────────────── */
+  /* ── Render UI ──────────────────────────────────────────────────────── */
 
-  // Contenedor para overlay AR — siempre presente para que dom-overlay
-  // funcione, pero invisible fuera de sesión
+  // Overlay siempre montado para que dom-overlay funcione
   const overlay = (
     <div
       ref={overlayRef}
-      className={phase === 'in-session' ? 'fixed inset-0 z-50' : 'pointer-events-none fixed inset-0 -z-10 opacity-0'}
+      className={
+        phase === 'in-session'
+          ? 'fixed inset-0 z-50 touch-none'
+          : 'pointer-events-none fixed inset-0 -z-10 opacity-0'
+      }
     >
       {phase === 'in-session' && (
-        <div className="absolute bottom-6 left-1/2 z-[60] -translate-x-1/2">
+        <div
+          data-xr-ui
+          className="absolute bottom-6 left-1/2 z-[60] flex -translate-x-1/2 gap-3"
+        >
           <button
             onClick={recenter}
-            className="rounded-xl bg-brand-700 px-6 py-3 text-sm font-semibold text-white shadow-lg hover:bg-brand-800 active:scale-95 transition-all"
+            className="rounded-xl bg-brand-700 px-5 py-3 text-sm font-semibold text-white shadow-lg hover:bg-brand-800 active:scale-95 transition-all"
           >
-            Recentrar modelo
+            Recentrar
           </button>
+          <button
+            onClick={resetScale}
+            className="rounded-xl bg-slate-800/90 px-5 py-3 text-sm font-semibold text-white shadow-lg hover:bg-slate-700 active:scale-95 transition-all"
+          >
+            Tamaño 1×
+          </button>
+        </div>
+      )}
+      {phase === 'in-session' && (
+        <div
+          data-xr-ui
+          className="pointer-events-none absolute top-6 left-1/2 z-[60] -translate-x-1/2 rounded-full bg-slate-900/70 px-4 py-1.5 text-xs text-slate-200"
+        >
+          Arrastra para rotar · Pellizca para escalar
         </div>
       )}
     </div>
@@ -267,7 +403,6 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
     )
   }
 
-  /* phase === 'pre' o 'in-session' */
   return (
     <>
       {overlay}
@@ -276,7 +411,7 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
   )
 }
 
-/* ── UI Sub-components ──────────────────────────────────────────────────── */
+/* ── Pantallas auxiliares ───────────────────────────────────────────────── */
 
 function PreLaunchScreen({
   machine,
@@ -293,8 +428,7 @@ function PreLaunchScreen({
 
         <p className="mt-6 text-sm leading-relaxed text-slate-600">
           Esta vista usa <strong className="font-semibold text-slate-800">WebXR</strong> para
-          mostrar el modelo 3D y paneles informativos directamente dentro de la escena AR
-          —no como overlay del navegador, sino como objetos en el espacio real.
+          mostrar el modelo 3D y paneles informativos directamente dentro de la escena AR.
         </p>
 
         <div className="mt-3 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2">
@@ -302,6 +436,13 @@ function PreLaunchScreen({
             Apunta la cámara hacia un piso o superficie despejada antes de iniciar.
           </p>
         </div>
+
+        <ul className="mt-4 space-y-1 text-xs text-slate-500">
+          <li>· El modelo aparecerá frente a ti al iniciar</li>
+          <li>· Arrastra con un dedo para rotarlo</li>
+          <li>· Pellizca con dos dedos para escalarlo</li>
+          <li>· Usa &quot;Recentrar&quot; si pierdes el modelo de vista</li>
+        </ul>
 
         <button
           onClick={onStart}
@@ -368,7 +509,7 @@ function ErrorScreen({
       </div>
       <h1 className="text-xl font-bold text-slate-900">No se pudo iniciar AR</h1>
       <p className="mt-3 max-w-xs text-sm text-slate-600 break-words">{message}</p>
-      <div className="mt-7 flex flex-col gap-3 w-full max-w-xs">
+      <div className="mt-7 flex w-full max-w-xs flex-col gap-3">
         <button
           onClick={onRetry}
           className="rounded-xl bg-brand-700 px-6 py-3 text-sm font-semibold text-white hover:bg-brand-800 transition-colors"

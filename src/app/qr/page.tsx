@@ -32,17 +32,37 @@ export default function QrPage() {
         </div>
       </nav>
 
-      <main className="mx-auto max-w-2xl px-4 py-6">
-        <p className="mb-6 text-sm text-slate-600 no-print">
-          Imprima estos códigos QR y fíjelos en cada máquina de tintorería.
-          Al escanearlos, el operario accede directamente a los datos y vista 3D/AR.
+      <main className="mx-auto max-w-2xl px-4 py-6 space-y-10">
+        <p className="text-sm text-slate-600 no-print">
+          Imprima los códigos QR y fíjelos en cada máquina de tintorería.
+          Cada máquina tiene <strong>dos QR</strong>: el de la vista estándar y el de la vista AR interactiva.
         </p>
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {MACHINE_CODES.map((codigo) => (
-            <QrCodeCard key={codigo} codigo={codigo} />
-          ))}
-        </div>
+        {/* ── Sección 1: Vista estándar ─────────────────────────── */}
+        <section>
+          <header className="mb-4 flex items-baseline gap-3">
+            <h2 className="text-lg font-bold text-slate-900">Vista estándar</h2>
+            <p className="text-xs text-slate-500">model-viewer + AR del sistema</p>
+          </header>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {MACHINE_CODES.map((codigo) => (
+              <QrCodeCard key={`std-${codigo}`} codigo={codigo} variant="standard" />
+            ))}
+          </div>
+        </section>
+
+        {/* ── Sección 2: AR Interactivo (WebXR) ─────────────────── */}
+        <section>
+          <header className="mb-4 flex items-baseline gap-3">
+            <h2 className="text-lg font-bold text-slate-900">AR interactivo</h2>
+            <p className="text-xs text-slate-500">WebXR · paneles flotantes en la escena</p>
+          </header>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {MACHINE_CODES.map((codigo) => (
+              <QrCodeCard key={`ar-${codigo}`} codigo={codigo} variant="ar" />
+            ))}
+          </div>
+        </section>
       </main>
     </div>
   )
