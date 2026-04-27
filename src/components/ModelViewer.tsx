@@ -11,10 +11,6 @@ interface ModelViewerAttributes extends React.HTMLAttributes<HTMLElement> {
   'ar-modes'?: string
   'camera-controls'?: ''
   'auto-rotate'?: ''
-  'camera-orbit'?: string
-  'min-camera-orbit'?: string
-  'max-camera-orbit'?: string
-  'field-of-view'?: string
   'shadow-intensity'?: string
   exposure?: string
   loading?: 'auto' | 'lazy' | 'eager'
@@ -36,7 +32,6 @@ interface Props {
   glbSrc: string
   usdzSrc?: string
   alt: string
-  cameraOrbit?: string
 }
 
 function ViewerSkeleton() {
@@ -71,7 +66,7 @@ function ModelFallback() {
   )
 }
 
-export default function ModelViewer({ glbSrc, usdzSrc, alt, cameraOrbit = '0deg 75deg 500%' }: Readonly<Props>) {
+export default function ModelViewer({ glbSrc, usdzSrc, alt }: Readonly<Props>) {
   const [mounted, setMounted] = useState(false)
   const [modelError, setModelError] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -103,10 +98,6 @@ export default function ModelViewer({ glbSrc, usdzSrc, alt, cameraOrbit = '0deg 
         ar-modes="webxr scene-viewer quick-look"
         camera-controls=""
         auto-rotate=""
-        camera-orbit={cameraOrbit}
-        field-of-view="20deg"
-        min-camera-orbit="auto auto 200%"
-        max-camera-orbit="auto auto 1000%"
         shadow-intensity="1"
         exposure="0.85"
         loading="lazy"

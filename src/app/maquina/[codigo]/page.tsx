@@ -150,6 +150,29 @@ export default function MaquinaPage({ params }: Readonly<{ params: { codigo: str
           </div>
         </section>
 
+        {/* ── CTA: Vista AR interactiva (WebXR) ─────────────────────────── */}
+        <Link
+          href={`/maquina/${machine.codigo}/ar`}
+          className="flex items-center justify-between gap-3 rounded-2xl border border-brand-200 bg-gradient-to-br from-brand-700 to-brand-800 px-5 py-4 shadow-sm hover:shadow-md transition-shadow"
+        >
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-wider text-blue-200">
+              Experimental
+            </p>
+            <p className="mt-0.5 text-sm font-bold text-white">
+              Ver en AR interactivo
+            </p>
+            <p className="mt-0.5 text-xs text-blue-100">
+              Modelo 3D + paneles de datos en la escena AR
+            </p>
+          </div>
+          <svg className="h-5 w-5 flex-shrink-0 text-white" viewBox="0 0 20 20" fill="currentColor">
+            <path fillRule="evenodd"
+              d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z"
+              clipRule="evenodd" />
+          </svg>
+        </Link>
+
         {/* ── ZONA 4: KPIs secundarios ──────────────────────────────────── */}
         <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
