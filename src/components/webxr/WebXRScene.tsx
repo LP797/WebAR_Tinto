@@ -41,13 +41,17 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
   const overlayRef = useRef<HTMLDivElement>(null)
   const sceneRef = useRef<SceneState | null>(null)
 
-  /* ── Orientación correcta del panel hacia la cámara (sin espejado) ─── */
+  /* ── Orientación correcta del panel hacia la cámara (sin espejado).
+        Compensa la rotación del padre (importante cuando un panel
+        está temporalmente attachado a un controller VR). ─── */
   const billboard = (() => {
     const fwd = new THREE.Vector3()
     const up = new THREE.Vector3(0, 1, 0)
     const right = new THREE.Vector3()
     const newUp = new THREE.Vector3()
     const m = new THREE.Matrix4()
+    const targetWorldQuat = new THREE.Quaternion()
+    const parentWorldQuat = new THREE.Quaternion()
     return (panel: THREE.Object3D, panelWorld: THREE.Vector3, camWorld: THREE.Vector3) => {
       fwd.subVectors(camWorld, panelWorld).normalize()
       right.crossVectors(up, fwd)
@@ -55,7 +59,13 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
       else right.normalize()
       newUp.crossVectors(fwd, right).normalize()
       m.makeBasis(right, newUp, fwd)
-      panel.quaternion.setFromRotationMatrix(m)
+      targetWorldQuat.setFromRotationMatrix(m)
+      if (panel.parent) {
+        panel.parent.getWorldQuaternion(parentWorldQuat).invert()
+        panel.quaternion.copy(parentWorldQuat).multiply(targetWorldQuat)
+      } else {
+        panel.quaternion.copy(targetWorldQuat)
+      }
     }
   })()
 
@@ -156,6 +166,75 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
       const panels = [mainPanel, kpiOEE, kpiRendimiento, kpiCalidad]
       const defaultPanelPos = panels.map((p) => p.position.clone())
       const positioned = { current: false }
+
+      /* ── WebXR Controllers (Meta Quest, Vision Pro, etc.) ───────────
+         Cada control tiene un rayo láser visible. Trigger (select):
+         - Si el rayo apunta a un panel: agarra ese panel
+         - Si apunta al modelo: agarra el modelGroup completo
+         - Soltar trigger: el objeto vuelve a su parent original */
+      const controller1 = renderer.xr.getController(0)
+      const controller2 = renderer.xr.getController(1)
+      scene.add(controller1)
+      scene.add(controller2)
+
+      const rayGeo = new THREE.BufferGeometry()
+      rayGeo.setAttribute(
+        'position',
+        new THREE.Float32BufferAttribute([0, 0, 0, 0, 0, -3], 3),
+      )
+      const rayMat = new THREE.LineBasicMaterial({ color: 0x4080ff, transparent: true, opacity: 0.7 })
+      const ray1 = new THREE.Line(rayGeo, rayMat)
+      const ray2 = new THREE.Line(rayGeo, rayMat)
+      controller1.add(ray1)
+      controller2.add(ray2)
+
+      const controllerMatrix = new THREE.Matrix4()
+      const controllerRaycaster = new THREE.Raycaster()
+
+      const raycastFromController = (controller: THREE.Object3D) => {
+        controllerMatrix.identity().extractRotation(controller.matrixWorld)
+        controllerRaycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld)
+        controllerRaycaster.ray.direction.set(0, 0, -1).applyMatrix4(controllerMatrix)
+      }
+
+      const onControllerSelectStart = (event: { target: THREE.Object3D }) => {
+        const controller = event.target
+        raycastFromController(controller)
+        // Prioridad: paneles
+        const panelHits = controllerRaycaster.intersectObjects(panels, false)
+        let target: THREE.Object3D | null = null
+        if (panelHits.length > 0) {
+          target = panelHits[0].object
+        } else {
+          // Probar contra el modelo (recursivo)
+          const modelHits = controllerRaycaster.intersectObject(innerModel, true)
+          if (modelHits.length > 0) {
+            target = modelGroup
+          }
+        }
+        if (target) {
+          controller.userData.selected = target
+          controller.userData.originalParent = target.parent
+          // attach() preserva la posición/rotación mundial al cambiar de padre
+          controller.attach(target)
+        }
+      }
+
+      const onControllerSelectEnd = (event: { target: THREE.Object3D }) => {
+        const controller = event.target
+        const target = controller.userData.selected as THREE.Object3D | undefined
+        const original = controller.userData.originalParent as THREE.Object3D | undefined
+        if (target && original) {
+          original.attach(target)
+        }
+        controller.userData.selected = undefined
+        controller.userData.originalParent = undefined
+      }
+
+      controller1.addEventListener('selectstart', onControllerSelectStart)
+      controller1.addEventListener('selectend', onControllerSelectEnd)
+      controller2.addEventListener('selectstart', onControllerSelectStart)
+      controller2.addEventListener('selectend', onControllerSelectEnd)
 
       /* Gestos:
          - 1 dedo sobre un panel: arrastra ese panel
@@ -315,6 +394,12 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
           overlayEl.removeEventListener('touchmove', onTouchMove)
           overlayEl.removeEventListener('touchend', onTouchEnd)
           overlayEl.removeEventListener('touchcancel', onTouchEnd)
+          controller1.removeEventListener('selectstart', onControllerSelectStart)
+          controller1.removeEventListener('selectend', onControllerSelectEnd)
+          controller2.removeEventListener('selectstart', onControllerSelectStart)
+          controller2.removeEventListener('selectend', onControllerSelectEnd)
+          rayGeo.dispose()
+          rayMat.dispose()
           window.removeEventListener('resize', onResize)
           renderer.setAnimationLoop(null)
           const activeSession = renderer.xr.getSession()
@@ -420,7 +505,7 @@ export default function WebXRScene({ machine }: Readonly<Props>) {
           data-xr-ui
           className="pointer-events-none absolute top-6 left-1/2 z-[60] -translate-x-1/2 rounded-full bg-slate-900/70 px-4 py-1.5 text-xs text-slate-200"
         >
-          Arrastra panel para moverlo · fuera de paneles para rotar · Pellizca para escalar
+          Móvil: arrastra panel/modelo · Pellizca para escalar · VR: trigger sobre panel/modelo para agarrarlo
         </div>
       )}
     </div>
@@ -509,9 +594,14 @@ function PreLaunchScreen({
 
         <ul className="mt-4 space-y-1 text-xs text-slate-500">
           <li>· El modelo aparecerá frente a ti al iniciar</li>
-          <li>· Toca y arrastra cada panel para reposicionarlo</li>
-          <li>· Arrastra fuera de paneles para rotar el conjunto</li>
-          <li>· Pellizca con dos dedos para escalar el modelo</li>
+          <li>
+            <strong className="font-semibold text-slate-700">Móvil:</strong>{' '}
+            arrastra paneles para moverlos · fuera de paneles para rotar · pellizca para escalar
+          </li>
+          <li>
+            <strong className="font-semibold text-slate-700">VR (Quest, Vision Pro):</strong>{' '}
+            apunta con el control y mantén el trigger para agarrar paneles o el modelo
+          </li>
           <li>· &quot;Recentrar&quot; o &quot;Restablecer&quot; si quieres reiniciar</li>
         </ul>
 
